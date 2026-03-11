@@ -3,6 +3,74 @@
 本文档说明两个脚本的用法：
 - `train_teacher_cmg.sh`
 - `train_student_cmg.sh`
+## 0. 目前的计划
+bash play_student.sh cmg_student_fast_v2 cmg_teacher_fast_v1 g1_cmg_fast --cmd_vx 2.0 --cmd_vy 0.0 --cmd_yaw 0.0
+bash play_teacher.sh cmg_teacher_fast_v1 g1_cmg_fast --cmd_vx 3.0 --cmd_vy 0.0 --cmd_yaw 0.0
+
+1. 进入环境
+
+  cd /root/TWIST-jiarui
+  conda activate twist
+
+  2. 阶段1：低速适配（不蒸馏，不加载 teacher）
+
+  - 从 cmg_student_fast_v2/model_7000.pt 续训
+  - 用 fast_low 任务扩展到低速
+
+  bash train_student_cmg.sh fast cmg_student_fast_v2_low cmg_teacher_fast_v1 cuda:0 -1 cmg_student_fast_v2 7000 2048 8200 unlock low g1_stu_rl_cmg_fast 1 1
+
+  bash train_student_cmg.sh fast cmg_student_fast_v2_low cmg_teacher_fast_v1 cuda:0 -1 cmg_student_fast_v2_low -1 2048 2500 unlock low g1_stu_rl_cmg_fast 1 1
+
+  ```bash
+  1. fast：speed_mode，速度档位。会走 fast 分支。
+  2. cmg_student_fast_v2_low：student_exptid，本次 student 训练/日志 run 名。
+  3. cmg_teacher_fast_v1：teacher_exptid，teacher run 名（用于定位老师模型）。
+  4. cuda:0：device，训练设备。
+  5. -1：teacher_checkpoint，老师 checkpoint 取最新。
+  6. cmg_student_fast_v2_low：resumeid，从这个 student run 继续训练。
+  7. -1：checkpoint，student 从该 run 的最新 checkpoint 恢复。
+  8. 2048：num_envs，并行环境数。
+  9. 2500：max_iterations，本次最多训练 2500 iter。
+  10. unlock：unlock_upper_body，会加 --unlock_upper_body（解锁上肢/全身跟踪）。
+  11. low：curriculum_stage，fast 下课程阶段；这里会把任务切到 g1_stu_rl_cmg_fast_low。
+  12. g1_stu_rl_cmg_fast：resume_proj_name，恢复时从这个项目目录找 run。
+  13. 1：startup_check，开启 30 秒启动体检。
+  14. 1：eval_student，开启 student-only 模式（不加载 teacher 做蒸馏，teacher KL 置 0）。
+  ```
+
+  最后一个 1 就是 eval_student=1（关蒸馏）。
+
+  3. 阶段2：回补高速（开蒸馏）
+
+  bash train_student_cmg.sh fast cmg_student_fast_v2_low cmg_teacher_fast_v1 cuda:0 -1
+  cmg_student_fast_v2_low -1 2048 9000 unlock full g1_stu_rl_cmg_fast 1 0
+
+  ```
+    1. fast：speed_mode，速度档位。
+  2. cmg_student_fast_v2_low：student_exptid，student 训练 run 名。
+  3. cmg_teacher_fast_v1：teacher_exptid，teacher run 名。
+  4. cuda:0：device，训练设备。
+  5. 2000：teacher_checkpoint，固定加载 teacher 的 model_2000.pt（不是最新）。
+  6. cmg_student_fast_v2_low：resumeid，从这个 student run 恢复。
+  7. -1：checkpoint，恢复 student 时取该 run 最新 checkpoint。
+  8. 2048：num_envs，并行环境数。
+  9. 9000：max_iterations，本次训练迭代数设为 9000。
+  10. unlock：unlock_upper_body，开启上肢解锁（会传 --unlock_upper_body）。
+  11. full：curriculum_stage，fast 任务下使用 full 课程。
+  12. g1_stu_rl_cmg_fast：resume_proj_name，恢复 checkpoint 时从这个项目目录找。
+  13. 1：startup_check，开启 30 秒启动自检。
+  14. 0：eval_student，关闭 student-only 模式，即启用 teacher 蒸馏（会加载 teacher）。
+  ```
+
+  最后一个 0 是 eval_student=0（开蒸馏）。
+  这里我建议 teacher checkpoint 固定用 2000，避免 -1 读到波动版本。
+
+  4. 快速验证
+
+  bash play_student.sh cmg_student_fast_v2_low cmg_teacher_fast_v1 g1_cmg_fast --cmd_vx 1.5 --cmd_vy 0.0 --cmd_yaw 0.0
+  bash play_student.sh cmg_student_fast_v2_low cmg_teacher_fast_v1 g1_cmg_fast --cmd_vx 3.0 --cmd_vy 0.0 --cmd_yaw 0.0
+
+
 
 ## 1. `train_teacher_cmg.sh`
 
@@ -56,6 +124,8 @@ bash train_teacher_cmg.sh medium cmg_teacher_medium_v1 cuda:0 cmg_teacher_medium
 5. 从最大的checkpoint，且环境数是2048
 ```
 bash train_teacher_cmg.sh medium cmg_teacher_medium_v1 cuda:0 cmg_teacher_medium_v1 -1 2048
+
+bash train_teacher_cmg.sh fast cmg_teacher_fast_v1 cuda:0 cmg_teacher_fast_v1 -1 2048
 ```
 说明：`checkpoint=-1` 表示自动选择最新 checkpoint。
 
@@ -128,7 +198,7 @@ bash train_student_cmg.sh medium cmg_student_medium_v1 cmg_teacher_medium_v1 cud
 
 4. 同时限制环境数和迭代数（降低显存压力时常用）：
 ```bash
-bash train_student_cmg.sh medium cmg_student_medium_v1 cmg_teacher_medium_v1 cuda:0 -1 "" "" 1024 6000
+bash train_student_cmg.sh fast cmg_student_medium_v1 cmg_teacher_medium_v1 cuda:0 -1 "" "" 1024 6000
 ```
 
 5. Student 从自己最后一个 checkpoint 续训，同时 Teacher 也读取最后一个 checkpoint：
@@ -236,89 +306,13 @@ bash compare_cmg_teacher_student.sh fast cmg_student_fast_v2 cmg_teacher_fast_v1
 - `play.py` 默认使用确定性评测配置（禁用 domain randomization），便于公平对比。
 - 如需恢复随机化播放，可在 `play_teacher.sh` 或 `play_student.sh` 里追加 `--eval_randomized`。
 
----
 
-## 7. CMG 对齐快速流程（推荐）
-
-1. 训练（CMG 对齐）：
-
-```bash
-bash train_student_cmg.sh fast cmg_student_fast_v2 cmg_teacher_fast_v1 cuda:0
-```
-
-2. 同命令对比 teacher/student：
-
-```bash
-bash compare_cmg_teacher_student.sh fast cmg_student_fast_v2 cmg_teacher_fast_v1 -1 -1 3.0 0.0 0.0
-```
-
----
-
-## 7. 恢复计划阶段 B/C 执行模板（`cmg_student_fast_v2`）
-
-### 7.1 阶段 B：稳定续训（默认 2048 + 30s 启动自检）
-
-`train_student_cmg.sh` 已支持：
-- 默认 `num_envs=2048`（可显式覆盖）
-- 30 秒启动检查（检查 `num_envs`、teacher/student checkpoint 加载、iteration 日志）
-- 单行续训命令模板回显
-- 续训前 checkpoint 路径预检（避免空跑）
-
-推荐单行续训命令（显式给 `resumeid/checkpoint/num_envs`）：
-
-```bash
-bash train_student_cmg.sh fast cmg_student_fast_v2 cmg_teacher_fast_v1 cuda:0 -1 cmg_student_fast_v2 -1 2048 1000 unlock full g1_stu_rl_cmg_fast 1
-```
-
-参数位说明（新增）：
-- 第 11 位：`curriculum_stage`，`fast` 任务可选 `full` / `narrow`
-- 第 12 位：`resume_proj_name`，支持跨项目迁移续训（例如 `g1_stu_rl_cmg_medium -> g1_stu_rl_cmg_fast`）
-- 第 13 位：`startup_check`，`1` 开启 30 秒体检
-
-### 7.2 阶段 C1：fast 命令范围收窄课程（推荐先做）
-
-`fast+narrow` 使用新任务：`g1_stu_rl_cmg_fast_narrow`
-- `cmg_vx_range = [2.2, 3.0]`
-- `cmg_vy_range = [-0.3, 0.3]`
-- `cmg_yaw_range = [-0.25, 0.25]`
-
-先跑窄范围 600 iter：
-
-```bash
-bash train_student_cmg.sh fast cmg_student_fast_v2_c1 cmg_teacher_fast_v1 cuda:0 -1 '' '' 2048 600 unlock narrow '' 1
-```
-
-达到 Gate 后放开到 full fast 再续：
-
-```bash
-bash train_student_cmg.sh fast cmg_student_fast_v2_c1 cmg_teacher_fast_v1 cuda:0 -1 cmg_student_fast_v2_c1 -1 2048 1200 unlock full g1_stu_rl_cmg_fast 1
-```
-
-### 7.3 阶段 C2：medium -> fast 迁移续训（当 C1 仍慢时）
-
-先在 medium 上训练 student（示例）：
-
-```bash
-bash train_student_cmg.sh medium cmg_student_medium_bridge_v1 cmg_teacher_medium_v1 cuda:0 -1 '' '' 2048 800 unlock full '' 1
-```
-
-再切到 fast 任务，使用 `resume_proj_name=g1_stu_rl_cmg_medium` 迁移：
-
-```bash
-bash train_student_cmg.sh fast cmg_student_fast_from_medium_v1 cmg_teacher_fast_v1 cuda:0 -1 cmg_student_medium_bridge_v1 -1 2048 1200 unlock full g1_stu_rl_cmg_medium 1
-```
-
-### 7.4 Gate 检查（阶段 C 闸门）
-
-训练日志会落到：`legged_gym/logs/<proj_name>/<exptid>/train_*.log`
-
-运行 Gate 检查：
-
-```bash
-python3 tools/check_student_gates.py --log legged_gym/logs/g1_stu_rl_cmg_fast/cmg_student_fast_v2/train_YYYYMMDD_HHMMSS.log
-```
-
-默认判定：
-- Gate-1（<=200）：`mean_reward` 末段为正且不下降
-- Gate-2（<=600）：`mean_episode_length` 末段 >= 15
-- Gate-3（<=1000）：`tracking_cmd_vel/yaw` 末段高于前段（非停滞）
+# skill
+直接在对话里点名：$isaac-rl，或自然描述 Isaac RL 训练/调参/排障需求。
+  3. 常用提问示例：
+      - $isaac-rl 帮我分析训练不收敛的原因，给最小改动方案
+      - $isaac-rl 基于这个任务配置给我 PPO 调参优先级
+      - $isaac-rl 比较 logs 目录下最近几次训练结果并建议下一组实验
+  4. 你也可以直接用内置脚本汇总日志：
+      - python /root/.codex/skills/isaac-rl/scripts/extract_metrics.py <log文件或目录>
+      - python /root/.codex/skills/isaac-rl/scripts/extract_metrics.py <log文件或目录> --json

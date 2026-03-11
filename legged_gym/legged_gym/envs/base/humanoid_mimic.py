@@ -80,6 +80,10 @@ class HumanoidMimic(HumanoidChar):
                 vx_range=tuple(self.cfg.motion.cmg_vx_range),
                 vy_range=tuple(self.cfg.motion.cmg_vy_range),
                 yaw_range=tuple(self.cfg.motion.cmg_yaw_range),
+                enable_cmd_switch=getattr(self.cfg.motion, 'enable_cmd_switch', False),
+                switch_time_range=tuple(getattr(self.cfg.motion, 'cmd_switch_time_range_s', [0.1, 1.0])),
+                switch_once_per_episode=getattr(self.cfg.motion, 'cmd_switch_once_per_episode', True),
+                cmd_switch_min_delta=tuple(getattr(self.cfg.motion, 'cmd_switch_min_delta', [0.2, 0.1, 0.1])),
             )
             self._use_cmg = True
             cprint(f"[HumanoidMimic] Using CMG motion generation", "cyan")
@@ -110,6 +114,14 @@ class HumanoidMimic(HumanoidChar):
         # compare two tensors are same
         # assert torch.equal(self._key_body_ids, torch.tensor(key_body_ids_motion, device=self.device, dtype=torch.long)), \
         #     f"Key body ids mismatch: {self._key_body_ids} vs {key_body_ids_motion}"
+
+        # Post-switch stability metrics (for CMG command-switch tasks).
+        self._cmd_switch_post_window_s = float(getattr(self.cfg.motion, "cmd_switch_post_window_s", 0.5))
+        self._cmd_switch_post_vel_err_sum = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_switch_post_yaw_err_sum = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_switch_post_samples = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_switch_roll_peak = torch.zeros(self.num_envs, device=self.device)
+        self._cmd_switch_pitch_peak = torch.zeros(self.num_envs, device=self.device)
     
     def _reset_ref_motion(self, env_ids, motion_ids=None):
         n = len(env_ids)
@@ -227,6 +239,7 @@ class HumanoidMimic(HumanoidChar):
             self.extras["episode"]['metric_' + key] = torch.mean(self.episode_sums[key][env_ids] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
             self.extras["episode"]['rew_' + key] = torch.mean(self.episode_sums[key][env_ids] * self.reward_scales[key] / self._motion_lib.get_motion_length(self._motion_ids[env_ids]))
             self.episode_sums[key][env_ids] = 0.
+        self._append_cmd_switch_episode_metrics(env_ids)
         
         if self.cfg.motion.motion_curriculum:
             self._update_motion_difficulty(env_ids)
@@ -271,6 +284,59 @@ class HumanoidMimic(HumanoidChar):
         _, _, y = euler_from_quaternion(self.root_states[:, 3:7])
         self.init_yaw[env_ids] = y[env_ids]
         return
+
+    def _append_cmd_switch_episode_metrics(self, env_ids):
+        """Append command-switch metrics to episode extras and reset per-env accumulators."""
+        if not getattr(self, "_use_cmg", False):
+            return
+        if not hasattr(self._motion_lib, "get_cmd_switch_status"):
+            return
+
+        switch_status = self._motion_lib.get_cmd_switch_status(env_ids=env_ids)
+        enabled = bool(switch_status["enabled"][0].item() > 0.5) if switch_status["enabled"].numel() > 0 else False
+        if not enabled:
+            self._cmd_switch_post_vel_err_sum[env_ids] = 0.0
+            self._cmd_switch_post_yaw_err_sum[env_ids] = 0.0
+            self._cmd_switch_post_samples[env_ids] = 0.0
+            self._cmd_switch_roll_peak[env_ids] = 0.0
+            self._cmd_switch_pitch_peak[env_ids] = 0.0
+            return
+
+        samples = self._cmd_switch_post_samples[env_ids]
+        denom = torch.clamp(samples, min=1.0)
+        mean_post_vel_err = self._cmd_switch_post_vel_err_sum[env_ids] / denom
+        mean_post_yaw_err = self._cmd_switch_post_yaw_err_sum[env_ids] / denom
+        sample_mask = samples > 0
+        if sample_mask.any():
+            mean_post_vel_err = torch.where(sample_mask, mean_post_vel_err, torch.zeros_like(mean_post_vel_err))
+            mean_post_yaw_err = torch.where(sample_mask, mean_post_yaw_err, torch.zeros_like(mean_post_yaw_err))
+        else:
+            mean_post_vel_err[:] = 0.0
+            mean_post_yaw_err[:] = 0.0
+
+        switch_count = switch_status["switch_count"].float()
+        switched_mask = switch_count > 0
+        if switched_mask.any():
+            mean_switch_time = torch.mean(switch_status["switch_time_s"][switched_mask])
+        else:
+            mean_switch_time = torch.tensor(0.0, device=self.device)
+
+        self.extras["episode"]["metric_cmd_switch_trigger_rate"] = torch.mean(switched_mask.float())
+        self.extras["episode"]["metric_cmd_switch_count"] = torch.mean(switch_count)
+        self.extras["episode"]["metric_cmd_switch_time_s"] = mean_switch_time
+        self.extras["episode"]["metric_cmd_range_violation_count"] = torch.mean(
+            switch_status["cmd_range_violation_count"].float()
+        )
+        self.extras["episode"]["metric_cmd_vel_err_post_switch"] = torch.mean(mean_post_vel_err)
+        self.extras["episode"]["metric_cmd_yaw_err_post_switch"] = torch.mean(mean_post_yaw_err)
+        self.extras["episode"]["metric_cmd_roll_peak_post_switch"] = torch.mean(self._cmd_switch_roll_peak[env_ids])
+        self.extras["episode"]["metric_cmd_pitch_peak_post_switch"] = torch.mean(self._cmd_switch_pitch_peak[env_ids])
+
+        self._cmd_switch_post_vel_err_sum[env_ids] = 0.0
+        self._cmd_switch_post_yaw_err_sum[env_ids] = 0.0
+        self._cmd_switch_post_samples[env_ids] = 0.0
+        self._cmd_switch_roll_peak[env_ids] = 0.0
+        self._cmd_switch_pitch_peak[env_ids] = 0.0
     
     def _hard_sync_motion_loop(self):
         motion_times = self._get_motion_times()
@@ -322,6 +388,42 @@ class HumanoidMimic(HumanoidChar):
         
         if self.cfg.domain_rand.push_end_effector and (self.common_step_counter % self.cfg.domain_rand.push_end_effector_interval == 0):
             self._push_end_effector()
+
+        self._update_cmd_switch_metrics()
+
+    def _update_cmd_switch_metrics(self):
+        """Track stability metrics in a short window after command switch."""
+        if not getattr(self, "_use_cmg", False):
+            return
+        if not hasattr(self._motion_lib, "get_cmd_switch_status"):
+            return
+
+        switch_status = self._motion_lib.get_cmd_switch_status()
+        enabled = bool(switch_status["enabled"][0].item() > 0.5) if switch_status["enabled"].numel() > 0 else False
+        if not enabled:
+            return
+
+        elapsed = switch_status["elapsed_since_last_switch_s"]
+        in_window = switch_status["has_switched"] & (elapsed >= 0.0) & (elapsed <= self._cmd_switch_post_window_s)
+        if not in_window.any():
+            return
+
+        cmg_commands = self._motion_lib.get_commands()
+        cmd_vel_err = torch.sqrt(
+            (cmg_commands[:, 0] - self.base_lin_vel[:, 0]) ** 2 +
+            (cmg_commands[:, 1] - self.base_lin_vel[:, 1]) ** 2
+        )
+        cmd_yaw_err = torch.abs(cmg_commands[:, 2] - self.base_ang_vel[:, 2])
+
+        self._cmd_switch_post_vel_err_sum[in_window] += cmd_vel_err[in_window]
+        self._cmd_switch_post_yaw_err_sum[in_window] += cmd_yaw_err[in_window]
+        self._cmd_switch_post_samples[in_window] += 1.0
+        self._cmd_switch_roll_peak[in_window] = torch.maximum(
+            self._cmd_switch_roll_peak[in_window], torch.abs(self.roll[in_window])
+        )
+        self._cmd_switch_pitch_peak[in_window] = torch.maximum(
+            self._cmd_switch_pitch_peak[in_window], torch.abs(self.pitch[in_window])
+        )
             
     def check_termination(self):
         contact_force_termination = torch.any(torch.norm(self.contact_forces[:, self.termination_contact_indices, :], dim=-1) > 1., dim=1)

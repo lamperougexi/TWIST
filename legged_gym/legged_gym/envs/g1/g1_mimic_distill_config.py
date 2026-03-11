@@ -447,6 +447,13 @@ class G1MimicStuRLCMGBaseCfg(G1MimicStuRLCfg):
         cmg_vy_range = [-0.3, 0.3]
         cmg_yaw_range = [-0.5, 0.5]
 
+        # Optional single-switch command pattern per episode: cmd_A -> cmd_B.
+        enable_cmd_switch = False
+        cmd_switch_time_range_s = [0.1, 1.0]
+        cmd_switch_once_per_episode = True
+        cmd_switch_min_delta = [0.25, 0.1, 0.1]
+        cmd_switch_post_window_s = 0.5
+
     class env(G1MimicStuRLCfg.env):
         track_root = False
         rand_reset = False
@@ -497,6 +504,56 @@ class G1MimicStuRLCMGFastCfg(G1MimicStuRLCMGBaseCfg):
         cmg_vx_range = [2.5, 3.5]
         cmg_vy_range = [-0.5, 0.5]
         cmg_yaw_range = [-0.5, 0.5]
+
+
+class G1MimicStuRLCMGFastLowCfg(G1MimicStuRLCMGBaseCfg):
+    """
+    Fast task low-speed extension:
+    keep fast upper bound while exposing lower forward commands.
+    """
+    class motion(G1MimicStuRLCMGBaseCfg.motion):
+        cmg_vx_range = [1.0, 3.5]
+        cmg_vy_range = [-0.5, 0.5]
+        cmg_yaw_range = [-0.5, 0.5]
+
+    class domain_rand(G1MimicStuRLCMGBaseCfg.domain_rand):
+        # Low-speed adaptation is more sensitive to strong random pushes.
+        push_interval_s = 6
+        max_push_vel_xy = 0.6
+        push_end_effector = False
+        max_push_force_end_effector = 12.0
+
+
+class G1MimicStuRLCMGFastLowCmdSwitchCfg(G1MimicStuRLCMGFastLowCfg):
+    """
+    Fast-low command-switch variant:
+    sample cmd_A at reset, then switch to cmd_B once after a random 0.1-1.0s delay.
+    """
+
+    class env(G1MimicStuRLCMGFastLowCfg.env):
+        # Lift horizon from 500 -> 600 steps (dt=0.02) for better late-stage discrimination.
+        episode_length_s = 12
+
+    class motion(G1MimicStuRLCMGFastLowCfg.motion):
+        # Slightly narrow high-speed tails to reduce collapse around command switch.
+        cmg_vx_range = [1.0, 3.4]
+        cmg_vy_range = [-0.45, 0.45]
+        cmg_yaw_range = [-0.45, 0.45]
+
+        enable_cmd_switch = True
+        # Delay switching a bit to let policy settle before cmd_B.
+        cmd_switch_time_range_s = [0.2, 1.2]
+        cmd_switch_once_per_episode = True
+        # Keep switch meaningful but reduce instantaneous shock magnitude.
+        cmd_switch_min_delta = [0.25, 0.12, 0.12]
+        cmd_switch_post_window_s = 0.7
+
+    class domain_rand(G1MimicStuRLCMGFastLowCfg.domain_rand):
+        # For cmdswitch stage, reduce random push intensity to isolate switch robustness.
+        push_interval_s = 8
+        max_push_vel_xy = 0.45
+        push_end_effector = False
+        max_push_force_end_effector = 10.0
 
 
 class G1MimicStuRLCMGFastNarrowCfg(G1MimicStuRLCMGBaseCfg):
@@ -613,6 +670,43 @@ class G1MimicStuRLCMGCfgDAgger(G1MimicStuRLCfgDAgger):
         dagger_coef = 0.10
         dagger_coef_min = 0.03
         dagger_coef_anneal_steps = 80000
+
+
+class G1MimicStuRLCMGFastCfgDAgger(G1MimicStuRLCMGCfgDAgger):
+    """DAgger/PPO settings specialized for full fast CMG fine-tuning stability."""
+
+    class algorithm(G1MimicStuRLCMGCfgDAgger.algorithm):
+        # Match fast_low stability settings: smaller updates, fixed LR, tighter clipping.
+        learning_rate = 6e-5
+        schedule = 'fixed'
+        num_learning_epochs = 3
+        clip_param = 0.15
+        max_grad_norm = 0.8
+        entropy_coef = 0.004
+        desired_kl = 0.003
+
+
+class G1MimicStuRLCMGFastLowCfgDAgger(G1MimicStuRLCMGCfgDAgger):
+    """DAgger/PPO settings specialized for fast_low adaptation stability."""
+
+    class algorithm(G1MimicStuRLCMGCfgDAgger.algorithm):
+        # Keep updates conservative to reduce value spikes during broad-range fine-tuning.
+        learning_rate = 6e-5
+        schedule = 'fixed'
+        num_learning_epochs = 3
+        clip_param = 0.15
+        max_grad_norm = 0.8
+        entropy_coef = 0.004
+        desired_kl = 0.003
+
+
+class G1MimicStuRLCMGFastLowCmdSwitchCfgDAgger(G1MimicStuRLCMGFastLowCfgDAgger):
+    """Stabilized DAgger/PPO settings for cmdswitch fine-tuning near long-horizon plateau."""
+
+    class algorithm(G1MimicStuRLCMGFastLowCfgDAgger.algorithm):
+        # Slightly tighter policy updates and lower entropy reduce random late-episode falls.
+        desired_kl = 0.0025
+        entropy_coef = 0.0035
 
 
 # ==================== CMG-based Configurations ====================
@@ -742,7 +836,7 @@ class G1MimicCMGSlowCfgPPO(G1MimicPrivCfgPPO):
         algorithm_class_name = 'PPO'
         runner_class_name = 'OnPolicyRunnerMimic'
         max_iterations = 30_002
-        save_interval = 500
+        save_interval = 100
         experiment_name = 'cmg_slow'
 
 
@@ -754,7 +848,7 @@ class G1MimicCMGMediumCfgPPO(G1MimicPrivCfgPPO):
         algorithm_class_name = 'PPO'
         runner_class_name = 'OnPolicyRunnerMimic'
         max_iterations = 30_002
-        save_interval = 500
+        save_interval = 100
         experiment_name = 'cmg_medium'
 
 
@@ -766,5 +860,15 @@ class G1MimicCMGFastCfgPPO(G1MimicPrivCfgPPO):
         algorithm_class_name = 'PPO'
         runner_class_name = 'OnPolicyRunnerMimic'
         max_iterations = 30_002
-        save_interval = 500
+        save_interval = 100
         experiment_name = 'cmg_fast'
+
+    class algorithm(G1MimicPrivCfgPPO.algorithm):
+        # Stabilize late-stage fast-teacher training:
+        # use gentler PPO updates to reduce episodic collapse spikes.
+        learning_rate = 8e-5
+        schedule = 'fixed'
+        num_learning_epochs = 3
+        clip_param = 0.15
+        max_grad_norm = 0.8
+        entropy_coef = 0.003

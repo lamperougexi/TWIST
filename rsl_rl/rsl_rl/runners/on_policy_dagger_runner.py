@@ -443,8 +443,24 @@ class OnPolicyDaggerRunner:
         # Keep algorithm schedules (e.g. dagger coefficient annealing) aligned after resume.
         if hasattr(self.alg, "counter"):
             self.alg.counter = loaded_dict.get('alg_counter', int(os.path.basename(path).split("_")[1].split(".")[0]))
-        if hasattr(self.alg, "dagger_coef") and ('dagger_coef' in loaded_dict):
-            self.alg.dagger_coef = loaded_dict['dagger_coef']
+        if hasattr(self.alg, "dagger_coef"):
+            if self.eval_student:
+                # In eval_student mode we intentionally disable teacher KL when resuming.
+                self.alg.dagger_coef = 0.0
+                if hasattr(self.alg, "initial_dagger_coef"):
+                    self.alg.initial_dagger_coef = 0.0
+                if hasattr(self.alg, "dagger_coef_min"):
+                    self.alg.dagger_coef_min = 0.0
+            elif 'dagger_coef' in loaded_dict:
+                loaded_dagger_coef = loaded_dict['dagger_coef']
+                if loaded_dagger_coef <= 0.0:
+                    # Resume from an eval_student checkpoint can save dagger_coef=0.
+                    # Re-enable distillation immediately when eval_student is off.
+                    fallback_dagger_coef = getattr(self.alg, "dagger_coef_min", 0.0)
+                    self.alg.dagger_coef = fallback_dagger_coef
+                    print(f"[Resume] Loaded dagger_coef={loaded_dagger_coef}. Reset to dagger_coef_min={fallback_dagger_coef}.")
+                else:
+                    self.alg.dagger_coef = loaded_dagger_coef
         # self.current_learning_iteration = loaded_dict['iter']
         self.current_learning_iteration = int(os.path.basename(path).split("_")[1].split(".")[0])
         self.env.global_counter = self.current_learning_iteration * 24

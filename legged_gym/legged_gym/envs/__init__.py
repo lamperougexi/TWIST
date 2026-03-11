@@ -44,6 +44,11 @@ from .g1.g1_mimic_distill_config import (
     G1MimicCMGMediumCfg, G1MimicCMGMediumCfgPPO,
     G1MimicCMGFastCfg, G1MimicCMGFastCfgPPO,
     G1MimicStuRLCMGSlowCfg, G1MimicStuRLCMGMediumCfg, G1MimicStuRLCMGFastCfg,
+    G1MimicStuRLCMGFastCfgDAgger,
+    G1MimicStuRLCMGFastLowCfg,
+    G1MimicStuRLCMGFastLowCfgDAgger,
+    G1MimicStuRLCMGFastLowCmdSwitchCfgDAgger,
+    G1MimicStuRLCMGFastLowCmdSwitchCfg,
     G1MimicStuRLCMGFastNarrowCfg,
 )
 
@@ -56,7 +61,9 @@ task_registry.register("g1_priv_mimic", G1MimicDistill, G1MimicPrivCfg(), G1Mimi
 task_registry.register("g1_stu_rl", G1MimicDistill, G1MimicStuRLCfg(), G1MimicStuRLCfgDAgger())
 task_registry.register("g1_stu_rl_cmg_slow", G1MimicDistill, G1MimicStuRLCMGSlowCfg(), G1MimicStuRLCMGCfgDAgger())
 task_registry.register("g1_stu_rl_cmg_medium", G1MimicDistill, G1MimicStuRLCMGMediumCfg(), G1MimicStuRLCMGCfgDAgger())
-task_registry.register("g1_stu_rl_cmg_fast", G1MimicDistill, G1MimicStuRLCMGFastCfg(), G1MimicStuRLCMGCfgDAgger())
+task_registry.register("g1_stu_rl_cmg_fast", G1MimicDistill, G1MimicStuRLCMGFastCfg(), G1MimicStuRLCMGFastCfgDAgger())
+task_registry.register("g1_stu_rl_cmg_fast_low", G1MimicDistill, G1MimicStuRLCMGFastLowCfg(), G1MimicStuRLCMGFastLowCfgDAgger())
+task_registry.register("g1_stu_rl_cmg_fast_low_cmdswitch", G1MimicDistill, G1MimicStuRLCMGFastLowCmdSwitchCfg(), G1MimicStuRLCMGFastLowCmdSwitchCfgDAgger())
 task_registry.register("g1_stu_rl_cmg_fast_narrow", G1MimicDistill, G1MimicStuRLCMGFastNarrowCfg(), G1MimicStuRLCMGCfgDAgger())
 
 # CMG-based environments (three speed tiers)

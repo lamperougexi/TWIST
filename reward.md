@@ -1,91 +1,88 @@
-# Reward Function 总结（当前项目）
+# 当前项目奖励函数与比重（源码对齐）
 
-## 1. 总体形式
-项目中的总奖励按以下方式计算：
+## 1. 统计范围
+- 任务注册来源：`legged_gym/legged_gym/envs/__init__.py`
+- 奖励实现来源：
+  - `legged_gym/legged_gym/envs/base/humanoid_mimic.py`
+  - `legged_gym/legged_gym/envs/g1/g1_mimic_distill.py`
+- 权重来源：`legged_gym/legged_gym/envs/g1/g1_mimic_distill_config.py` 的各配置类 `rewards.scales`
+
+## 2. 奖励总式与生效权重
+总奖励：
 
 \[
-r_t = \sum_i \big(w_i \cdot f_i(s_t, a_t)\big)
+r_t=\sum_i \left(f_i \cdot w_i\right)
 \]
 
 其中：
-- `f_i` 是具体 reward function（定义在 `legged_gym/legged_gym/envs/base/humanoid_mimic.py` 和 `legged_gym/legged_gym/envs/g1/g1_mimic_distill.py`）
-- `w_i` 是配置里的 `rewards.scales.<name>`
-- 代码里会先把所有非零 `w_i` 乘以 `dt`（见 `legged_gym/legged_gym/envs/base/legged_robot.py::_prepare_reward_function`）
+- `f_i`：对应 `_reward_<name>()`
+- `w_i`：配置中的 `rewards.scales.<name>`
 
-注意：下面表格给的是**配置原始权重**（未乘 `dt`）。
+运行时会对每个非零 scale 乘 `dt`（`_prepare_reward_function` in `legged_gym/legged_gym/envs/base/legged_robot.py`），本项目配置下：
+- `sim.dt = 0.002`
+- `control.decimation = 10`
+- 训练步长 `dt = 0.02`
+- 生效权重 `w_eff = w_raw * 0.02`
 
----
+备注：
+- 当前这些配置里 `regularization_names` 为空，因此 `regularization_scale` 不会额外作用到任何项。
 
-## 2. 当前项目主要任务与对应权重
-仓库注册了这些任务（`legged_gym/legged_gym/envs/__init__.py`）：
-- `g1_priv_mimic`（mocap teacher）
-- `g1_stu_rl`（student）
-- `g1_cmg_slow / g1_cmg_medium / g1_cmg_fast`（CMG teacher）
+## 3. 任务与权重模板映射
+- `g1_priv_mimic` -> `G1MimicPrivCfg.rewards.scales`
+- `g1_stu_rl` -> `G1MimicStuRLCfg.rewards.scales`
+- `g1_stu_rl_cmg_slow / medium / fast / fast_low / fast_low_cmdswitch / fast_narrow` -> `G1MimicStuRLCMGBaseCfg.rewards.scales`（各子类奖励权重一致）
+- `g1_cmg_slow / medium / fast` -> `G1MimicCMGBaseCfg.rewards.scales`（三者奖励权重一致）
 
-其中 `g1_cmg_slow/medium/fast` 的 reward 权重相同，只是速度命令范围不同。
+说明：`G1MimicStuRLCMGBaseCfg.rewards.scales` 与 `G1MimicCMGBaseCfg.rewards.scales` 在当前代码中数值相同。
 
-### 2.1 `g1_priv_mimic` / `g1_stu_rl`（非 CMG）
-来源：`G1MimicPrivCfg.rewards.scales` 与 `G1MimicStuRLCfg.rewards.scales`
+## 4. 所有奖励函数与比重（含中文解释）
+表中 `-` 表示该奖励函数已实现，但该任务配置未设置 scale（不参与总奖励）。
 
-| reward_function | 含义（简述） | 权重 |
-|---|---|---:|
-| `tracking_joint_dof` | 跟踪参考关节角（exp 形式） | 0.6 |
-| `tracking_joint_vel` | 跟踪参考关节角速度（exp） | 0.2 |
-| `tracking_root_pose` | 跟踪根部位姿（位置+朝向，exp） | 0.6 |
-| `tracking_root_vel` | 跟踪根部线/角速度（exp） | 1.0 |
-| `tracking_keybody_pos` | 跟踪关键点位置（exp） | 2.0 |
-| `feet_slip` | 惩罚接触时脚底滑移 | -0.1 |
-| `feet_contact_forces` | 惩罚过大足端接触力 | -5e-4 |
-| `feet_stumble` | 惩罚绊脚接触 | -1.25 |
-| `dof_pos_limits` | 惩罚超关节限位 | -5.0 |
-| `dof_torque_limits` | 惩罚超软扭矩限 | -1.0 |
-| `dof_vel` | 惩罚关节速度平方和 | -1e-4 |
-| `dof_acc` | 惩罚关节加速度平方和 | -5e-8 |
-| `action_rate` | 惩罚动作变化过快 | -0.01 |
-| `feet_air_time` | 足端腾空时间项 | 5.0 |
-| `ang_vel_xy` | 惩罚机体横滚/俯仰角速度 | -0.01 |
-| `total_angular_momentum` | 惩罚全身总角动量（绕系统质心） | -0.01 |
-| `ankle_dof_acc` | 惩罚踝关节加速度平方和 | -1e-7 |
-| `ankle_dof_vel` | 惩罚踝关节速度平方和 | -2e-4 |
+| reward function | 中文解释 | g1_priv_mimic | g1_stu_rl | g1_stu_rl_cmg_* / g1_cmg_* |
+|---|---|---:|---:|---:|
+| `tracking_joint_dof` | 跟踪参考关节角，姿态误差越小奖励越高 | 0.6 | 0.65 | 0.6 |
+| `tracking_joint_vel` | 跟踪参考关节角速度，动作节奏越接近参考越好 | 0.2 | 0.22 | 0.2 |
+| `tracking_root_pose` | 跟踪躯干根部位置与朝向 | 0.6 | 0.6 | 0.2 |
+| `tracking_root_vel` | 跟踪躯干根部线速度与角速度 | 1.2 | 1.3 | 0.8 |
+| `tracking_keybody_pos` | 跟踪关键身体点（脚/膝/手/肘/头等）位置 | 2.4 | 2.6 | 2.0 |
+| `tracking_keybody_pos_upper` | 仅跟踪上半身关键点（手、肘、头） | - | - | 0.3 |
+| `tracking_cmd_vel` | 跟踪 CMG 命令线速度 `vx, vy` | - | - | 1.5 |
+| `tracking_cmd_yaw` | 跟踪 CMG 命令偏航角速度 `yaw_rate` | - | - | 1.0 |
+| `action_symmetry` | 鼓励左右肢体动作近似镜像对称 | - | - | 0.1 |
+| `feet_slip` | 惩罚脚接触地面时的水平滑移 | -0.1 | -0.055 | -0.1 |
+| `feet_contact_forces` | 惩罚足端接触力过大（超过阈值） | -5e-4 | -4e-4 | -5e-4 |
+| `feet_stumble` | 惩罚绊脚/异常碰撞（水平冲击过强） | -1.25 | -1.25 | -1.25 |
+| `dof_pos_limits` | 惩罚关节角超出安全范围 | -5.0 | -5.0 | -5.0 |
+| `dof_torque_limits` | 惩罚关节扭矩接近或超过软限位 | -1.0 | -1.0 | -1.0 |
+| `dof_vel` | 惩罚关节速度过大（抑制抖动） | -1e-4 | -1e-4 | -1e-4 |
+| `dof_acc` | 惩罚关节加速度过大（抑制突变） | -5e-8 | -5e-8 | -5e-8 |
+| `action_rate` | 惩罚相邻时刻动作变化过快 | -0.01 | -0.005 | -0.01 |
+| `feet_air_time` | 调整步态摆动相位，鼓励合适的腾空时长 | 5.0 | 4.5 | 5.0 |
+| `ang_vel_xy` | 惩罚机体绕 x/y 轴角速度（抑制横滚俯仰晃动） | -0.01 | -0.01 | -0.01 |
+| `total_angular_momentum` | 惩罚全身总角动量过大，提升稳定性 | -0.01 | -0.01 | -0.01 |
+| `ankle_dof_acc` | 专门惩罚踝关节加速度过大 | -1e-7 | -1e-7 | -1e-7 |
+| `ankle_dof_vel` | 专门惩罚踝关节速度过大 | -2e-4 | -2e-4 | -2e-4 |
+| `alive` | 存活奖励（每步常数奖励） | - | - | - |
+| `tracking_feet_height` | 跟踪双脚高度与参考高度的一致性 | - | - | - |
+| `collision` | 惩罚非允许身体部位碰撞 | - | - | - |
+| `feet_height` | 约束脚部高度接近目标高度 | - | - | - |
+| `lin_vel_z` | 惩罚机体竖直方向速度过大 | - | - | - |
+| `orientation` | 惩罚机体姿态偏离竖直 | - | - | - |
+| `torque_penalty` | 惩罚关节扭矩平方和（抑制能耗/暴力控制） | - | - | - |
+| `waist_dof_acc` | 专门惩罚腰部关节加速度过大 | - | - | - |
+| `waist_dof_vel` | 专门惩罚腰部关节速度过大 | - | - | - |
+| `ankle_action` | 专门惩罚踝关节动作幅度过大 | - | - | - |
 
-### 2.2 `g1_cmg_slow` / `g1_cmg_medium` / `g1_cmg_fast`（CMG）
-来源：`G1MimicCMGBaseCfg.rewards.scales`
-
-| reward_function | 含义（简述） | 权重 |
-|---|---|---:|
-| `tracking_joint_dof` | 跟踪参考关节角（exp） | 0.6 |
-| `tracking_joint_vel` | 跟踪参考关节角速度（exp） | 0.2 |
-| `tracking_root_pose` | 跟踪根部位姿（exp） | 0.2 |
-| `tracking_root_vel` | 跟踪根部速度（exp） | 0.8 |
-| `tracking_keybody_pos` | 跟踪关键点位置（CMG 下主要下半身） | 2.0 |
-| `tracking_keybody_pos_upper` | 上半身关键点跟踪（当前关闭） | 0.0 |
-| `tracking_cmd_vel` | 跟踪 CMG 命令速度 `vx, vy`（exp） | 1.5 |
-| `tracking_cmd_yaw` | 跟踪 CMG 命令偏航角速度（exp） | 1.0 |
-| `action_symmetry` | 左右动作镜像对称性奖励（exp） | 0.1 |
-| `feet_slip` | 惩罚接触时脚底滑移 | -0.1 |
-| `feet_contact_forces` | 惩罚过大足端接触力 | -5e-4 |
-| `feet_stumble` | 惩罚绊脚接触 | -1.25 |
-| `dof_pos_limits` | 惩罚超关节限位 | -5.0 |
-| `dof_torque_limits` | 惩罚超软扭矩限 | -1.0 |
-| `dof_vel` | 惩罚关节速度平方和 | -1e-4 |
-| `dof_acc` | 惩罚关节加速度平方和 | -5e-8 |
-| `action_rate` | 惩罚动作变化过快 | -0.01 |
-| `feet_air_time` | 足端腾空时间项 | 5.0 |
-| `ang_vel_xy` | 惩罚机体横滚/俯仰角速度 | -0.01 |
-| `total_angular_momentum` | 惩罚全身总角动量（绕系统质心） | -0.01 |
-| `ankle_dof_acc` | 惩罚踝关节加速度平方和（继承） | -1e-7 |
-| `ankle_dof_vel` | 惩罚踝关节速度平方和（继承） | -2e-4 |
-
----
-
-## 3. 关键 reward function 定义（简化）
-- `tracking_joint_dof`: `exp(-0.15 * Σ(w_dof * (q_ref-q)^2))`
-- `tracking_joint_vel`: `exp(-0.01 * Σ(w_dof * (dq_ref-dq)^2))`
-- `tracking_root_pose`: `exp(-5.0 * (||Δp||^2 + 0.1*Δrot^2))`
-- `tracking_root_vel`: `exp(-1.0 * (||Δv||^2 + 0.5*||Δω||^2))`
-- `tracking_keybody_pos`: `exp(-10.0 * Σ||Δkeybody||^2)`
-- `tracking_keybody_pos_upper`: `exp(-5.0 * Σ||Δupper_keybody||^2)`
-- `tracking_cmd_vel`: `exp(-2.0 * ((v_x^cmd-v_x)^2 + (v_y^cmd-v_y)^2))`
-- `tracking_cmd_yaw`: `exp(-(ω_z^cmd-ω_z)^2)`
-- `action_symmetry`: `exp(-0.5 * MSE(a_left - mirror(a_right)))`
-- `total_angular_momentum`: `||L/M||^2`，其中 `L = Σ((r_i-r_com) × m_i(v_i-v_com))`
+## 5. 常用奖励函数定义位置
+- `tracking_joint_dof`: `humanoid_mimic.py::_reward_tracking_joint_dof`
+- `tracking_joint_vel`: `humanoid_mimic.py::_reward_tracking_joint_vel`
+- `tracking_root_pose`: `humanoid_mimic.py::_reward_tracking_root_pose`
+- `tracking_root_vel`: `humanoid_mimic.py::_reward_tracking_root_vel`
+- `tracking_keybody_pos`: `humanoid_mimic.py::_reward_tracking_keybody_pos`
+- `tracking_keybody_pos_upper`: `humanoid_mimic.py::_reward_tracking_keybody_pos_upper`
+- `tracking_cmd_vel`: `humanoid_mimic.py::_reward_tracking_cmd_vel`
+- `tracking_cmd_yaw`: `humanoid_mimic.py::_reward_tracking_cmd_yaw`
+- `action_symmetry`: `humanoid_mimic.py::_reward_action_symmetry`
+- `total_angular_momentum`: `humanoid_mimic.py::_reward_total_angular_momentum`
+- `ankle_dof_acc`: `g1_mimic_distill.py::_reward_ankle_dof_acc`
+- `ankle_dof_vel`: `g1_mimic_distill.py::_reward_ankle_dof_vel`

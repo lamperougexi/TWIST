@@ -9,7 +9,7 @@ import os
 import torch
 import torch.nn as nn
 import numpy as np
-from typing import Optional, List, Tuple
+from typing import Optional, List, Tuple, Dict
 
 import sys
 # 添加 cmg_workspace 到 Python 路径
@@ -88,6 +88,10 @@ class CMGMotionLib:
         vx_range: Tuple[float, float] = (0.5, 1.5),
         vy_range: Tuple[float, float] = (-0.3, 0.3),
         yaw_range: Tuple[float, float] = (-0.5, 0.5),
+        enable_cmd_switch: bool = False,
+        switch_time_range: Tuple[float, float] = (0.1, 1.0),
+        switch_once_per_episode: bool = True,
+        cmd_switch_min_delta: Tuple[float, float, float] = (0.2, 0.1, 0.1),
         root_height: float = 0.75,
     ):
         """
@@ -104,6 +108,10 @@ class CMGMotionLib:
             vx_range: Range for forward velocity commands (m/s)
             vy_range: Range for lateral velocity commands (m/s)
             yaw_range: Range for yaw rate commands (rad/s)
+            enable_cmd_switch: Enable one-episode command switch (cmd_A -> cmd_B)
+            switch_time_range: Random switch delay range in seconds
+            switch_once_per_episode: If True, switch at most once per episode
+            cmd_switch_min_delta: Minimum absolute delta between cmd_A and cmd_B
             root_height: Default root height (m)
         """
         self._device = device
@@ -113,6 +121,12 @@ class CMGMotionLib:
         self._vx_range = vx_range
         self._vy_range = vy_range
         self._yaw_range = yaw_range
+        self._enable_cmd_switch = bool(enable_cmd_switch)
+        sw_low = float(min(switch_time_range[0], switch_time_range[1]))
+        sw_high = float(max(switch_time_range[0], switch_time_range[1]))
+        self._switch_time_range = (sw_low, max(sw_high, sw_low + 1e-6))
+        self._switch_once_per_episode = bool(switch_once_per_episode)
+        self._cmd_switch_min_delta = torch.tensor(cmd_switch_min_delta, device=device, dtype=torch.float)
         self._root_height = root_height
 
         # Load CMG model and stats
@@ -136,7 +150,9 @@ class CMGMotionLib:
         print(f"[CMGMotionLib] Initialized with {num_envs} envs, "
               f"vx=[{vx_range[0]:.1f}, {vx_range[1]:.1f}], "
               f"vy=[{vy_range[0]:.1f}, {vy_range[1]:.1f}], "
-              f"yaw=[{yaw_range[0]:.1f}, {yaw_range[1]:.1f}]")
+              f"yaw=[{yaw_range[0]:.1f}, {yaw_range[1]:.1f}], "
+              f"cmd_switch={self._enable_cmd_switch}, "
+              f"switch_t=[{self._switch_time_range[0]:.2f}, {self._switch_time_range[1]:.2f}]s")
 
     def _load_cmg_model(self, model_path: str, data_path: str):
         """Load CMG model and normalization statistics."""
@@ -221,12 +237,82 @@ class CMGMotionLib:
         self._dof_mirror_signs = torch.tensor(DOF_MIRROR_SIGNS_23, device=self._device, dtype=torch.float)
         self._keybody_mirror_indices = torch.tensor(KEYBODY_MIRROR_INDICES, device=self._device, dtype=torch.long)
 
+        # Command-switch state: cmd_A -> cmd_B at a random delay.
+        self._cmd_a = torch.zeros(self._num_envs, 3, device=self._device)
+        self._cmd_b = torch.zeros(self._num_envs, 3, device=self._device)
+        self._switch_time_s = torch.full((self._num_envs,), float("inf"), device=self._device)
+        self._first_switch_time_s = torch.full((self._num_envs,), float("inf"), device=self._device)
+        self._last_switch_time_s = torch.full((self._num_envs,), float("inf"), device=self._device)
+        self._has_switched = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
+        self._switch_event = torch.zeros(self._num_envs, dtype=torch.bool, device=self._device)
+        self._switch_count = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
+        self._cmd_range_violation_count = torch.zeros(self._num_envs, dtype=torch.long, device=self._device)
+
     def _sample_commands(self, n: int) -> torch.Tensor:
         """Sample random velocity commands within configured ranges."""
         vx = torch.rand(n, device=self._device) * (self._vx_range[1] - self._vx_range[0]) + self._vx_range[0]
         vy = torch.rand(n, device=self._device) * (self._vy_range[1] - self._vy_range[0]) + self._vy_range[0]
         yaw = torch.rand(n, device=self._device) * (self._yaw_range[1] - self._yaw_range[0]) + self._yaw_range[0]
         return torch.stack([vx, vy, yaw], dim=-1)
+
+    def _clamp_commands(self, commands: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Clamp commands into configured ranges and return violation mask."""
+        cmd_min = torch.tensor(
+            [self._vx_range[0], self._vy_range[0], self._yaw_range[0]],
+            device=self._device,
+            dtype=commands.dtype,
+        )
+        cmd_max = torch.tensor(
+            [self._vx_range[1], self._vy_range[1], self._yaw_range[1]],
+            device=self._device,
+            dtype=commands.dtype,
+        )
+        clamped = torch.maximum(torch.minimum(commands, cmd_max), cmd_min)
+        violation = (clamped - commands).abs().sum(dim=-1) > 1e-6
+        return clamped, violation
+
+    def _sample_switch_delay(self, n: int) -> torch.Tensor:
+        """Sample switch delay in seconds."""
+        low, high = self._switch_time_range
+        delay = torch.rand(n, device=self._device) * (high - low) + low
+        return torch.clamp(delay, min=self._dt)
+
+    def _sample_cmd_b(self, cmd_a: torch.Tensor, max_resample: int = 8) -> torch.Tensor:
+        """
+        Sample cmd_B in range while enforcing a minimum delta from cmd_A.
+        A command is accepted if any one dimension exceeds the configured threshold.
+        """
+        n = cmd_a.shape[0]
+        cmd_b = self._sample_commands(n)
+        min_delta = self._cmd_switch_min_delta.to(dtype=cmd_a.dtype).unsqueeze(0)
+        valid = (torch.abs(cmd_b - cmd_a) >= min_delta).any(dim=-1)
+
+        for _ in range(max_resample):
+            if valid.all():
+                break
+            invalid_idx = (~valid).nonzero(as_tuple=False).flatten()
+            cmd_b[invalid_idx] = self._sample_commands(len(invalid_idx))
+            valid = (torch.abs(cmd_b - cmd_a) >= min_delta).any(dim=-1)
+
+        if not valid.all():
+            # Fall back to deterministic far-bound commands for any stubborn samples.
+            invalid_idx = (~valid).nonzero(as_tuple=False).flatten()
+            mid = torch.tensor(
+                [
+                    0.5 * (self._vx_range[0] + self._vx_range[1]),
+                    0.5 * (self._vy_range[0] + self._vy_range[1]),
+                    0.5 * (self._yaw_range[0] + self._yaw_range[1]),
+                ],
+                device=self._device,
+                dtype=cmd_a.dtype,
+            )
+            low = torch.tensor([self._vx_range[0], self._vy_range[0], self._yaw_range[0]], device=self._device, dtype=cmd_a.dtype)
+            high = torch.tensor([self._vx_range[1], self._vy_range[1], self._yaw_range[1]], device=self._device, dtype=cmd_a.dtype)
+            fallback = torch.where(cmd_a[invalid_idx] < mid.unsqueeze(0), high.unsqueeze(0), low.unsqueeze(0))
+            cmd_b[invalid_idx] = fallback
+
+        cmd_b, _ = self._clamp_commands(cmd_b)
+        return cmd_b
 
     def _get_init_motion(self, n: int) -> torch.Tensor:
         """Get initial motion states from training data samples."""
@@ -397,6 +483,43 @@ class CMGMotionLib:
         if len(env_ids) == 0:
             return
 
+        self._switch_event[env_ids] = False
+
+        # Trigger command switch for due environments before advancing one frame.
+        # This ensures the current step uses cmd_B right after crossing switch_time.
+        if self._enable_cmd_switch:
+            due = self._motion_times[env_ids] >= self._switch_time_s[env_ids]
+            if self._switch_once_per_episode:
+                due &= ~self._has_switched[env_ids]
+            if due.any():
+                switch_ids = env_ids[due]
+                frame_idx = self._buffer_frame_idx[switch_ids].clamp(0, self.TRAJECTORY_BUFFER_FRAMES - 1)
+                self._current_motion_norm[switch_ids] = self._trajectory_buffer[switch_ids, frame_idx]
+                self._root_pos[switch_ids] = self._root_pos_buffer[switch_ids, frame_idx]
+                self._root_rot[switch_ids] = self._root_rot_buffer[switch_ids, frame_idx]
+                self._root_yaw[switch_ids] = 2.0 * torch.atan2(
+                    self._root_rot[switch_ids, 3], self._root_rot[switch_ids, 0]
+                )
+
+                self._commands[switch_ids] = self._cmd_b[switch_ids]
+                self._switch_event[switch_ids] = True
+                self._has_switched[switch_ids] = True
+                self._switch_count[switch_ids] += 1
+                self._last_switch_time_s[switch_ids] = self._motion_times[switch_ids]
+                first_switch = self._first_switch_time_s[switch_ids] == float("inf")
+                if first_switch.any():
+                    ids_first = switch_ids[first_switch]
+                    self._first_switch_time_s[ids_first] = self._motion_times[ids_first]
+
+                if self._switch_once_per_episode:
+                    self._switch_time_s[switch_ids] = float("inf")
+                else:
+                    self._cmd_a[switch_ids] = self._commands[switch_ids]
+                    self._cmd_b[switch_ids] = self._sample_cmd_b(self._cmd_a[switch_ids])
+                    self._switch_time_s[switch_ids] = self._motion_times[switch_ids] + self._sample_switch_delay(len(switch_ids))
+
+                self._generate_trajectory(switch_ids)
+
         # Advance buffer frame index
         self._buffer_frame_idx[env_ids] += 1
 
@@ -428,12 +551,33 @@ class CMGMotionLib:
 
         # Reset motion times
         self._motion_times[env_ids] = 0.0
+        self._cmd_range_violation_count[env_ids] = 0
 
-        # Sample or set commands
+        # Sample or set cmd_A
         if commands is None:
-            self._commands[env_ids] = self._sample_commands(n)
+            cmd_a = self._sample_commands(n)
         else:
-            self._commands[env_ids] = commands
+            cmd_a = commands.to(device=self._device, dtype=torch.float)
+
+        cmd_a, violation_a = self._clamp_commands(cmd_a)
+        if violation_a.any():
+            self._cmd_range_violation_count[env_ids[violation_a]] += 1
+
+        if self._enable_cmd_switch:
+            cmd_b = self._sample_cmd_b(cmd_a)
+            self._cmd_b[env_ids] = cmd_b
+            self._switch_time_s[env_ids] = self._sample_switch_delay(n)
+        else:
+            self._cmd_b[env_ids] = cmd_a
+            self._switch_time_s[env_ids] = float("inf")
+
+        self._cmd_a[env_ids] = cmd_a
+        self._commands[env_ids] = cmd_a
+        self._first_switch_time_s[env_ids] = float("inf")
+        self._last_switch_time_s[env_ids] = float("inf")
+        self._has_switched[env_ids] = False
+        self._switch_event[env_ids] = False
+        self._switch_count[env_ids] = 0
 
         # Get initial motion states
         init_motion = self._get_init_motion(n)
@@ -750,6 +894,30 @@ class CMGMotionLib:
         """Return motion names. For CMG, return command descriptions."""
         return [f"cmg_vx{self._vx_range}_vy{self._vy_range}_yaw{self._yaw_range}"]
 
+    def get_cmd_switch_status(self, env_ids: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Return command-switch telemetry for logging and metrics.
+        All returned tensors are detached clones to avoid accidental in-place edits.
+        """
+        if env_ids is None:
+            env_ids = torch.arange(self._num_envs, device=self._device)
+
+        elapsed = torch.full((len(env_ids),), -1.0, device=self._device)
+        valid = self._last_switch_time_s[env_ids].isfinite()
+        if valid.any():
+            ids = valid.nonzero(as_tuple=False).flatten()
+            elapsed[ids] = self._motion_times[env_ids[ids]] - self._last_switch_time_s[env_ids[ids]]
+
+        return {
+            "enabled": torch.full((len(env_ids),), float(self._enable_cmd_switch), device=self._device),
+            "has_switched": self._has_switched[env_ids].clone(),
+            "just_switched": self._switch_event[env_ids].clone(),
+            "switch_count": self._switch_count[env_ids].clone(),
+            "switch_time_s": self._first_switch_time_s[env_ids].clone(),
+            "elapsed_since_last_switch_s": elapsed,
+            "cmd_range_violation_count": self._cmd_range_violation_count[env_ids].clone(),
+        }
+
     def get_commands(self) -> torch.Tensor:
         """Get current velocity commands for all environments.
         Returns mirrored commands (vy, yaw negated) for mirrored environments."""
@@ -762,4 +930,16 @@ class CMGMotionLib:
 
     def set_commands(self, env_ids: torch.Tensor, commands: torch.Tensor):
         """Set velocity commands for specified environments."""
+        commands = commands.to(device=self._device, dtype=torch.float)
+        commands, violation = self._clamp_commands(commands)
+        if violation.any():
+            self._cmd_range_violation_count[env_ids[violation]] += 1
         self._commands[env_ids] = commands
+        self._cmd_a[env_ids] = commands
+        self._cmd_b[env_ids] = commands
+        self._switch_time_s[env_ids] = float("inf")
+        self._first_switch_time_s[env_ids] = float("inf")
+        self._last_switch_time_s[env_ids] = float("inf")
+        self._has_switched[env_ids] = False
+        self._switch_event[env_ids] = False
+        self._switch_count[env_ids] = 0

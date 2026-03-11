@@ -1,12 +1,13 @@
 #!/bin/bash
 # Student training script using a CMG teacher checkpoint
 # Usage:
-# bash train_student_cmg.sh <speed_mode> <student_exptid> <teacher_exptid> <device> [teacher_checkpoint] [resumeid] [checkpoint] [num_envs] [max_iterations] [unlock_upper_body=unlock] [curriculum_stage=full] [resume_proj_name] [startup_check=1]
+# bash train_student_cmg.sh <speed_mode> <student_exptid> <teacher_exptid> <device> [teacher_checkpoint] [resumeid] [checkpoint] [num_envs] [max_iterations] [unlock_upper_body=unlock] [curriculum_stage=full] [resume_proj_name] [startup_check=1] [eval_student=0]
 #
 # Notes:
 # - Stage-B defaults: num_envs=2048 and startup_check=1
-# - Stage-C curriculum_stage for fast task: full | narrow
+# - Stage-C curriculum_stage for fast task: full | low | narrow | cmdswitch
 # - Cross-project resume (medium->fast migration) can be enabled with resume_proj_name
+# - Set eval_student=1 to disable teacher distillation during student fine-tuning
 
 set -euo pipefail
 
@@ -40,6 +41,7 @@ unlock_upper_body=${10:-unlock}
 curriculum_stage=${11:-full}
 resume_proj_name=${12:-}
 startup_check=${13:-1}
+eval_student=${14:-0}
 
 # Map CMG speed mode to teacher project folder and CMG-aligned student task.
 case "${speed_mode}" in
@@ -57,9 +59,23 @@ case "${speed_mode}" in
         teacher_proj_name="g1_cmg_fast"
         task_name="g1_stu_rl_cmg_fast"
         proj_name="g1_stu_rl_cmg_fast"
-        if [ "${curriculum_stage}" = "narrow" ]; then
-            task_name="g1_stu_rl_cmg_fast_narrow"
-        fi
+        case "${curriculum_stage}" in
+            full)
+                ;;
+            low)
+                task_name="g1_stu_rl_cmg_fast_low"
+                ;;
+            narrow)
+                task_name="g1_stu_rl_cmg_fast_narrow"
+                ;;
+            cmdswitch)
+                task_name="g1_stu_rl_cmg_fast_low_cmdswitch"
+                ;;
+            *)
+                echo "Error: Invalid curriculum_stage '${curriculum_stage}' for speed_mode='fast'. Must be one of: full, low, narrow, cmdswitch"
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "Error: Invalid speed_mode '${speed_mode}'. Must be one of: slow, medium, fast"
@@ -125,15 +141,22 @@ fi
 if [ -n "${unlock_upper_body}" ]; then
     echo "Unlock Upper Body: ${unlock_upper_body}"
 fi
+if [ "${eval_student}" = "1" ] || [ "${eval_student}" = "true" ]; then
+    echo "Eval Student Mode: enabled (no teacher distillation)"
+fi
 echo "============================================"
 
-teacher_run_dir="legged_gym/logs/${teacher_proj_name}/${teacher_exptid}"
-teacher_model_path=$(resolve_model_path "${teacher_run_dir}" "${teacher_checkpoint}" || true)
-if [ -z "${teacher_model_path}" ]; then
-    echo "Error: teacher checkpoint not found in '${teacher_run_dir}' with checkpoint='${teacher_checkpoint}'"
-    exit 1
+if [ "${eval_student}" != "1" ] && [ "${eval_student}" != "true" ]; then
+    teacher_run_dir="legged_gym/logs/${teacher_proj_name}/${teacher_exptid}"
+    teacher_model_path=$(resolve_model_path "${teacher_run_dir}" "${teacher_checkpoint}" || true)
+    if [ -z "${teacher_model_path}" ]; then
+        echo "Error: teacher checkpoint not found in '${teacher_run_dir}' with checkpoint='${teacher_checkpoint}'"
+        exit 1
+    fi
+    echo "[Precheck] Teacher model: ${teacher_model_path}"
+else
+    echo "[Precheck] Skip teacher checkpoint check because eval_student=1"
 fi
-echo "[Precheck] Teacher model: ${teacher_model_path}"
 
 if [ -n "${resumeid}" ]; then
     student_resume_dir="legged_gym/logs/${resume_proj_name_effective}/${resumeid}"
@@ -176,6 +199,10 @@ if [ "${unlock_upper_body}" = "unlock" ] || [ "${unlock_upper_body}" = "true" ] 
     cmd+=(--unlock_upper_body)
 fi
 
+if [ "${eval_student}" = "1" ] || [ "${eval_student}" = "true" ]; then
+    cmd+=(--eval_student)
+fi
+
 run_log_dir="../../logs/${proj_name}/${exptid}"
 mkdir -p "${run_log_dir}"
 run_log="${run_log_dir}/train_$(date +%Y%m%d_%H%M%S).log"
@@ -184,7 +211,7 @@ echo "[TrainLog] ${run_log}"
 echo "[TrainCmd] ${cmd[*]}"
 
 echo "[Template] Resume command (single line):"
-echo "bash train_student_cmg.sh ${speed_mode} ${exptid} ${teacher_exptid} ${device} ${teacher_checkpoint} ${exptid} -1 ${num_envs} ${max_iterations:-30002} ${unlock_upper_body} ${curriculum_stage} ${proj_name} 1"
+echo "bash train_student_cmg.sh ${speed_mode} ${exptid} ${teacher_exptid} ${device} ${teacher_checkpoint} ${exptid} -1 ${num_envs} ${max_iterations:-30002} ${unlock_upper_body} ${curriculum_stage} ${proj_name} 1 ${eval_student}"
 
 # Keep a plain training log for startup checks and gate checks.
 ("${cmd[@]}" 2>&1 | tee -a "${run_log}") &
@@ -203,11 +230,15 @@ if [ "${startup_check}" = "1" ]; then
         echo "[StartupCheck][OK] Num Envs=${num_envs}"
     fi
 
-    if ! ${SEARCH_BIN} -q "Loading teacher policy from" "${run_log}"; then
-        echo "[StartupCheck][FAIL] Teacher checkpoint load log not found"
-        startup_ok=0
+    if [ "${eval_student}" != "1" ] && [ "${eval_student}" != "true" ]; then
+        if ! ${SEARCH_BIN} -q "Loading teacher policy from" "${run_log}"; then
+            echo "[StartupCheck][FAIL] Teacher checkpoint load log not found"
+            startup_ok=0
+        else
+            echo "[StartupCheck][OK] Teacher checkpoint loaded"
+        fi
     else
-        echo "[StartupCheck][OK] Teacher checkpoint loaded"
+        echo "[StartupCheck][OK] eval_student=1, teacher checkpoint load skipped"
     fi
 
     if [ -n "${resumeid}" ]; then
